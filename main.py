@@ -786,3 +786,242 @@ async def startup():
     if not os.path.exists(DATA_FILE):
         save_data({"inbounds": [], "users": {}, "settings": {"password": "admin", "lang": "fa"}})
     generate_xray_config()
+# ========== ادامه مسیرها ==========
+
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Cookie, Form
+
+# ========== صفحه ورود ==========
+
+@app.get("/login")
+async def login_page(request: Request):
+    return HTMLResponse(content=LOGIN_TEMPLATE.replace("{{ error }}", ""))
+
+@app.post("/login")
+async def login_post(request: Request, password: str = Form(...)):
+    if password == get_password():
+        resp = RedirectResponse("/", status_code=302)
+        resp.set_cookie("auth", "true")
+        return resp
+    else:
+        return HTMLResponse(content=LOGIN_TEMPLATE.replace("{{ error }}", '<div class="error">❌ رمز اشتباه است!</div>'))
+
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse("/login", status_code=302)
+    resp.delete_cookie("auth")
+    return resp
+
+# ========== صفحه اصلی ==========
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request, lang: Optional[str] = Cookie(None)):
+    if request.cookies.get("auth") != "true":
+        return RedirectResponse("/login", status_code=302)
+    
+    data = load_data()
+    inbounds = data.get("inbounds", [])
+    users = data.get("users", {})
+    lang = get_lang_from_cookie(lang)
+    
+    total_users = sum(len(inb.get("users", [])) for inb in inbounds)
+    total_traffic = sum(u.get("usage", 0) for u in users.values()) / (1024**3)
+    
+    # رندر جدول
+    rows = ""
+    for i, inbound in enumerate(inbounds):
+        rows += f"""
+        <tr>
+            <td>{inbound.get('name', '')}</td>
+            <td><span class="badge badge-{inbound.get('protocol', 'vless')}">{inbound.get('protocol', 'vless').upper()}</span></td>
+            <td>{inbound.get('port', 10086)}</td>
+            <td>{inbound.get('path', '/ws')}</td>
+            <td>{inbound.get('sni', '-')}</td>
+            <td>{len(inbound.get('users', []))}</td>
+            <td>
+                <button class="btn btn-sm btn-secondary" onclick="viewInbound('{i}')">👁️</button>
+                <button class="btn btn-sm btn-danger" onclick="deleteInbound('{i}')">🗑️</button>
+            </td>
+        </tr>
+        """
+    
+    table = f"""
+    <div style="overflow-x:auto;">
+    <table>
+        <thead><tr><th>نام</th><th>پروتکل</th><th>پورت</th><th>مسیر</th><th>SNI</th><th>کاربران</th><th>عملیات</th></tr></thead>
+        <tbody>{rows}</tbody>
+    </table>
+    </div>
+    """ if rows else '<div class="empty">هنوز اینباندی ساخته نشده است</div>'
+    
+    # قالب نهایی
+    html = HTML_TEMPLATE
+    html = html.replace("{{ lang }}", lang)
+    html = html.replace("{{ inbounds_count }}", str(len(inbounds)))
+    html = html.replace("{{ users_count }}", str(total_users))
+    html = html.replace("{{ online_users }}", str(len([u for u in users.values() if u.get("online", False)])))
+    html = html.replace("{{ total_traffic }}", str(round(total_traffic, 2)))
+    html = html.replace('<div class="card">\n        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; flex-wrap:wrap; gap:10px;">\n            <h2 style="margin:0; border:none; padding:0;">📡 اینباندها</h2>\n            <button class="btn" onclick="openModal(\'addInbound\')">+ افزودن اینباند</button>\n        </div>\n        {% if inbounds %}', f'<div class="card">\n        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; flex-wrap:wrap; gap:10px;">\n            <h2 style="margin:0; border:none; padding:0;">📡 اینباندها</h2>\n            <button class="btn" onclick="openModal(\'addInbound\')">+ افزودن اینباند</button>\n        </div>\n        {table}')
+    
+    # حذف {% if inbounds %} و {% else %} و {% endif %}
+    import re
+    html = re.sub(r'\{% if inbounds %\}', '', html)
+    html = re.sub(r'\{% else %\}', '', html)
+    html = re.sub(r'\{% endif %\}', '', html)
+    
+    return HTMLResponse(content=html)
+
+# ========== مدیریت اینباندها ==========
+
+@app.post("/add_inbound")
+async def add_inbound(
+    name: str = Form(...),
+    protocol: str = Form("vless"),
+    port: int = Form(10086),
+    network: str = Form("ws"),
+    path: str = Form("/ws"),
+    sni: str = Form(""),
+    tls: str = Form("true")
+):
+    data = load_data()
+    inbound = {
+        "name": name,
+        "protocol": protocol,
+        "port": port,
+        "network": network,
+        "path": path,
+        "sni": sni,
+        "tls": tls == "true",
+        "users": []
+    }
+    data["inbounds"].append(inbound)
+    save_data(data)
+    generate_xray_config()
+    return RedirectResponse("/", status_code=302)
+
+@app.post("/delete_inbound/{index}")
+async def delete_inbound(index: int):
+    data = load_data()
+    if 0 <= index < len(data["inbounds"]):
+        for user_id in data["inbounds"][index].get("users", []):
+            data["users"].pop(user_id, None)
+        data["inbounds"].pop(index)
+        save_data(data)
+        generate_xray_config()
+    return RedirectResponse("/", status_code=302)
+
+@app.get("/inbound/{index}")
+async def get_inbound(index: int):
+    data = load_data()
+    if 0 <= index < len(data["inbounds"]):
+        inbound = data["inbounds"][index]
+        inbound["domain"] = get_domain()
+        # اضافه کردن اطلاعات کاربران
+        users_list = []
+        for user_id in inbound.get("users", []):
+            user_data = data["users"].get(user_id, {})
+            users_list.append({
+                "id": user_id,
+                "name": user_data.get("email", f"user_{user_id[:8]}"),
+                "limit": user_data.get("limit", 0),
+                "expiry": user_data.get("expiry", ""),
+                "usage": user_data.get("usage", 0),
+                "online": user_data.get("online", False)
+            })
+        inbound["users"] = users_list
+        return JSONResponse(inbound)
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+# ========== مدیریت کاربران ==========
+
+@app.post("/add_user/{index}")
+async def add_user(index: int, request: Request):
+    data = load_data()
+    if 0 <= index < len(data["inbounds"]):
+        body = await request.json()
+        user_id = str(uuid_lib.uuid4())
+        user_data = {
+            "email": body.get("email", f"user_{user_id[:8]}"),
+            "limit": body.get("limit", 0),
+            "expiry": body.get("expiry", ""),
+            "usage": 0,
+            "online": False,
+            "created": datetime.now().isoformat()
+        }
+        data["users"][user_id] = user_data
+        data["inbounds"][index]["users"].append(user_id)
+        save_data(data)
+        generate_xray_config()
+        return JSONResponse({"status": "ok"})
+    return JSONResponse({"error": "Inbound not found"}, status_code=404)
+
+@app.post("/delete_user/{user_id}")
+async def delete_user(user_id: str):
+    data = load_data()
+    for inbound in data["inbounds"]:
+        if user_id in inbound["users"]:
+            inbound["users"].remove(user_id)
+    data["users"].pop(user_id, None)
+    save_data(data)
+    generate_xray_config()
+    return JSONResponse({"status": "ok"})
+
+# ========== تنظیمات ==========
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request):
+    if request.cookies.get("auth") != "true":
+        return RedirectResponse("/login", status_code=302)
+    
+    lang = request.cookies.get("lang", "fa")
+    html = SETTINGS_TEMPLATE
+    html = html.replace("{{ lang }}", lang)
+    html = html.replace("{{ success }}", "")
+    html = html.replace("{{ error }}", "")
+    return HTMLResponse(content=html)
+
+@app.post("/settings")
+async def settings_post(
+    request: Request,
+    new_password: str = Form(...),
+    confirm_password: str = Form(...)
+):
+    if request.cookies.get("auth") != "true":
+        return RedirectResponse("/login", status_code=302)
+    
+    lang = request.cookies.get("lang", "fa")
+    html = SETTINGS_TEMPLATE
+    
+    if len(new_password) < 4:
+        html = html.replace("{{ lang }}", lang)
+        html = html.replace("{{ success }}", "")
+        html = html.replace("{{ error }}", '<div class="error">❌ رمز باید حداقل ۴ کاراکتر باشد!</div>')
+        return HTMLResponse(content=html)
+    
+    if new_password != confirm_password:
+        html = html.replace("{{ lang }}", lang)
+        html = html.replace("{{ success }}", "")
+        html = html.replace("{{ error }}", '<div class="error">❌ رمزها مطابقت ندارند!</div>')
+        return HTMLResponse(content=html)
+    
+    set_password(new_password)
+    html = html.replace("{{ lang }}", lang)
+    html = html.replace("{{ error }}", "")
+    html = html.replace("{{ success }}", '<div class="msg">✅ رمز با موفقیت تغییر کرد!</div>')
+    return HTMLResponse(content=html)
+
+# ========== تغییر زبان ==========
+
+@app.get("/set_lang/{lang}")
+async def set_lang(lang: str):
+    if lang not in ['fa', 'en']:
+        lang = 'fa'
+    resp = RedirectResponse("/", status_code=302)
+    resp.set_cookie("lang", lang)
+    return resp
+
+# ========== اجرا ==========
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
